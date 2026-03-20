@@ -1,0 +1,27 @@
+stm32h750xbh6/lv_draw_sw_dither.o: \
+  ..\lvgl-8.4.0\src\draw\sw\lv_draw_sw_dither.c \
+  ..\lvgl-8.4.0\src\draw\sw\lv_draw_sw_dither.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\core\lv_obj_pos.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\core\..\misc\lv_area.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\core\..\misc\..\lv_conf_internal.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\core\..\misc\..\lv_conf_kconfig.h \
+  ..\lvgl-8.4.0\lv_conf.h \
+  ..\lvgl-8.4.0\src\draw\sw\lv_draw_sw_gradient.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_color.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\..\lv_conf_internal.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_assert.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_log.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_types.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_mem.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_math.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_style.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\..\font\lv_font.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\..\font\..\lv_conf_internal.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\..\font\lv_symbol_def.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\..\font\..\misc\lv_area.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_area.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_anim.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_txt.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_printf.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_bidi.h \
+  ..\lvgl-8.4.0\src\draw\sw\..\..\misc\lv_style_gen.h

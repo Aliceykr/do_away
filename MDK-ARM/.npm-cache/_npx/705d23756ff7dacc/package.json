@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "mcp-remote": "^0.1.38"
+  },
+  "_npx": {
+    "packages": [
+      "mcp-remote"
+    ]
+  }
+}
