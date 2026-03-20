@@ -74,6 +74,14 @@ static lv_obj_t *wave_bound_change_button = NULL;
 static lv_obj_t *wave_bound_freq_textarea = NULL;
 static lv_obj_t *wave_bound_vpp_textarea = NULL;
 
+typedef struct
+{
+    uint32_t sample_rate_hz;
+    uint32_t prescaler_div;
+    uint32_t period_counts;
+    uint16_t sample_count;
+} WaveOutputPlan_t;
+
 static uintptr_t Wave_AlignUp(uintptr_t value, uintptr_t alignment)
 {
     return (value + alignment - 1U) & ~(alignment - 1U);
@@ -263,36 +271,46 @@ static uint32_t Wave_GetTim6ClockHz(void)
     return (pclk1_hz * 2U);
 }
 
-static HAL_StatusTypeDef Wave_ConfigTim6ForSampleRate(uint32_t sample_rate_hz)
+static HAL_StatusTypeDef Wave_ComputeTim6Counts(uint32_t timer_clk_hz,
+                                                uint32_t sample_rate_hz,
+                                                uint32_t *prescaler_div,
+                                                uint32_t *period_counts)
 {
-    TIM_MasterConfigTypeDef master_config = {0};
-    uint32_t timer_clk_hz;
-    uint32_t prescaler_div;
-    uint32_t period_counts;
     uint64_t prescaler_denominator;
     uint64_t denominator;
 
-    if (sample_rate_hz == 0U) {
+    if ((sample_rate_hz == 0U) || (prescaler_div == NULL) || (period_counts == NULL)) {
         return HAL_ERROR;
     }
 
-    timer_clk_hz = Wave_GetTim6ClockHz();
     prescaler_denominator = (uint64_t)WAVE_TIMER_MAX_COUNT * (uint64_t)sample_rate_hz;
-    prescaler_div = (uint32_t)(((uint64_t)timer_clk_hz + prescaler_denominator - 1ULL) /
-                               prescaler_denominator);
-    if ((prescaler_div == 0U) || (prescaler_div > WAVE_TIMER_MAX_COUNT)) {
+    *prescaler_div = (uint32_t)(((uint64_t)timer_clk_hz + prescaler_denominator - 1ULL) /
+                                prescaler_denominator);
+    if ((*prescaler_div == 0U) || (*prescaler_div > WAVE_TIMER_MAX_COUNT)) {
         return HAL_ERROR;
     }
 
-    denominator = (uint64_t)sample_rate_hz * (uint64_t)prescaler_div;
-    period_counts = (uint32_t)(((uint64_t)timer_clk_hz + (denominator / 2ULL)) / denominator);
-    if ((period_counts == 0U) || (period_counts > WAVE_TIMER_MAX_COUNT)) {
+    denominator = (uint64_t)sample_rate_hz * (uint64_t)(*prescaler_div);
+    *period_counts = (uint32_t)(((uint64_t)timer_clk_hz + (denominator / 2ULL)) / denominator);
+    if ((*period_counts == 0U) || (*period_counts > WAVE_TIMER_MAX_COUNT)) {
         return HAL_ERROR;
     }
 
-    htim6.Init.Prescaler = prescaler_div - 1U;
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef Wave_ConfigTim6ForOutputPlan(const WaveOutputPlan_t *output_plan)
+{
+    TIM_MasterConfigTypeDef master_config = {0};
+
+    if ((output_plan == NULL) || (output_plan->prescaler_div == 0U) ||
+        (output_plan->period_counts == 0U)) {
+        return HAL_ERROR;
+    }
+
+    htim6.Init.Prescaler = output_plan->prescaler_div - 1U;
     htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim6.Init.Period = period_counts - 1U;
+    htim6.Init.Period = output_plan->period_counts - 1U;
     htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
     if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
@@ -325,21 +343,36 @@ static void Wave_StopOutput(void)
     (void)HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
 }
 
-static void Wave_BuildOutputPlan(WaveType_t wave_type,
-                                 uint32_t output_freq_hz,
-                                 uint32_t *sample_rate_hz,
-                                 uint16_t *sample_count)
+static HAL_StatusTypeDef Wave_BuildOutputPlan(WaveType_t wave_type,
+                                              uint32_t output_freq_hz,
+                                              WaveOutputPlan_t *output_plan)
 {
-    uint32_t planned_samples;
+    uint32_t timer_clk_hz;
 
-    if ((sample_rate_hz == NULL) || (sample_count == NULL)) {
-        return;
+    if (output_plan == NULL) {
+        return HAL_ERROR;
     }
 
+    timer_clk_hz = Wave_GetTim6ClockHz();
+
     if (wave_type == WAVE_TYPE_NONE) {
-        *sample_count = WAVE_PERIOD_SAMPLES_MIN;
-        *sample_rate_hz = WAVE_DAC_IDLE_SAMPLE_RATE_HZ;
-        return;
+        uint64_t actual_divisor;
+
+        output_plan->sample_count = WAVE_PERIOD_SAMPLES_MIN;
+        output_plan->sample_rate_hz = WAVE_DAC_IDLE_SAMPLE_RATE_HZ;
+        if (Wave_ComputeTim6Counts(timer_clk_hz,
+                                   output_plan->sample_rate_hz,
+                                   &output_plan->prescaler_div,
+                                   &output_plan->period_counts) != HAL_OK) {
+            return HAL_ERROR;
+        }
+
+        actual_divisor =
+            (uint64_t)output_plan->prescaler_div * (uint64_t)output_plan->period_counts;
+        output_plan->sample_rate_hz =
+            (uint32_t)(((uint64_t)timer_clk_hz + (actual_divisor / 2ULL)) / actual_divisor);
+
+        return HAL_OK;
     }
 
     if (output_freq_hz < WAVE_MIN_OUTPUT_FREQ_HZ) {
@@ -348,16 +381,68 @@ static void Wave_BuildOutputPlan(WaveType_t wave_type,
         output_freq_hz = WAVE_MAX_OUTPUT_FREQ_HZ;
     }
 
-    planned_samples = WAVE_DAC_SAMPLE_RATE_MAX_HZ / output_freq_hz;
-    if (planned_samples > WAVE_PERIOD_SAMPLES_MAX) {
-        planned_samples = WAVE_PERIOD_SAMPLES_MAX;
-    }
-    if (planned_samples < WAVE_PERIOD_SAMPLES_MIN) {
-        planned_samples = WAVE_PERIOD_SAMPLES_MIN;
+    {
+        uint8_t best_found = 0U;
+        uint64_t best_error_numerator = 0U;
+        uint64_t best_error_denominator = 1U;
+
+        for (uint32_t candidate_samples = WAVE_PERIOD_SAMPLES_MIN;
+             candidate_samples <= WAVE_PERIOD_SAMPLES_MAX;
+             ++candidate_samples) {
+            WaveOutputPlan_t candidate_plan;
+            uint32_t candidate_target_sample_rate_hz;
+            uint64_t candidate_divisor;
+            uint64_t candidate_denominator;
+            uint64_t target_scaled;
+            uint64_t candidate_error_numerator;
+
+            candidate_target_sample_rate_hz = output_freq_hz * candidate_samples;
+            if ((candidate_target_sample_rate_hz == 0U) ||
+                (candidate_target_sample_rate_hz > WAVE_DAC_SAMPLE_RATE_MAX_HZ)) {
+                continue;
+            }
+
+            if (Wave_ComputeTim6Counts(timer_clk_hz,
+                                       candidate_target_sample_rate_hz,
+                                       &candidate_plan.prescaler_div,
+                                       &candidate_plan.period_counts) != HAL_OK) {
+                continue;
+            }
+
+            candidate_plan.sample_count = (uint16_t)candidate_samples;
+            candidate_divisor =
+                (uint64_t)candidate_plan.prescaler_div * (uint64_t)candidate_plan.period_counts;
+            candidate_plan.sample_rate_hz =
+                (uint32_t)(((uint64_t)timer_clk_hz + (candidate_divisor / 2ULL)) /
+                           candidate_divisor);
+            candidate_denominator = candidate_divisor * (uint64_t)candidate_plan.sample_count;
+            target_scaled = (uint64_t)output_freq_hz * candidate_denominator;
+
+            if (target_scaled >= (uint64_t)timer_clk_hz) {
+                candidate_error_numerator = target_scaled - (uint64_t)timer_clk_hz;
+            } else {
+                candidate_error_numerator = (uint64_t)timer_clk_hz - target_scaled;
+            }
+
+            if ((best_found == 0U) ||
+                (candidate_error_numerator * best_error_denominator <
+                 best_error_numerator * candidate_denominator) ||
+                ((candidate_error_numerator * best_error_denominator ==
+                  best_error_numerator * candidate_denominator) &&
+                 (candidate_plan.sample_count > output_plan->sample_count))) {
+                *output_plan = candidate_plan;
+                best_error_numerator = candidate_error_numerator;
+                best_error_denominator = candidate_denominator;
+                best_found = 1U;
+            }
+        }
+
+        if (best_found == 0U) {
+            return HAL_ERROR;
+        }
     }
 
-    *sample_count = (uint16_t)planned_samples;
-    *sample_rate_hz = output_freq_hz * planned_samples;
+    return HAL_OK;
 }
 
 static HAL_StatusTypeDef Wave_BuildPeriodBuffer(WaveType_t wave_type,
@@ -393,8 +478,7 @@ static void Wave_ProcessPendingOutputUpdate(void)
     WaveType_t requested_type;
     uint32_t requested_freq_hz;
     uint32_t requested_vpp_mv;
-    uint32_t sample_rate_hz = 0U;
-    uint16_t sample_count = 0U;
+    WaveOutputPlan_t output_plan = {0};
 
     requested_type = wave_requested_type;
     requested_freq_hz = wave_requested_freq_hz;
@@ -410,22 +494,24 @@ static void Wave_ProcessPendingOutputUpdate(void)
 
     wave_output_update_pending = 0U;
 
-    Wave_BuildOutputPlan(requested_type, requested_freq_hz, &sample_rate_hz, &sample_count);
-
-    Wave_StopOutput();
-
-    if (Wave_BuildPeriodBuffer(requested_type, requested_vpp_mv, sample_count) != HAL_OK) {
+    if (Wave_BuildOutputPlan(requested_type, requested_freq_hz, &output_plan) != HAL_OK) {
         Error_Handler();
     }
 
-    if (Wave_ConfigTim6ForSampleRate(sample_rate_hz) != HAL_OK) {
+    Wave_StopOutput();
+
+    if (Wave_BuildPeriodBuffer(requested_type, requested_vpp_mv, output_plan.sample_count) != HAL_OK) {
+        Error_Handler();
+    }
+
+    if (Wave_ConfigTim6ForOutputPlan(&output_plan) != HAL_OK) {
         Error_Handler();
     }
 
     if (HAL_DAC_Start_DMA(&hdac1,
                           DAC_CHANNEL_1,
                           (uint32_t *)wave_dma_buffer,
-                          sample_count,
+                          output_plan.sample_count,
                           DAC_ALIGN_12B_R) != HAL_OK) {
         Error_Handler();
     }
@@ -439,8 +525,8 @@ static void Wave_ProcessPendingOutputUpdate(void)
     wave_active_type = requested_type;
     wave_active_freq_hz = requested_freq_hz;
     wave_active_vpp_mv = requested_vpp_mv;
-    wave_period_sample_rate_hz = sample_rate_hz;
-    wave_period_sample_count = sample_count;
+    wave_period_sample_rate_hz = output_plan.sample_rate_hz;
+    wave_period_sample_count = output_plan.sample_count;
     wave_output_started = 1U;
     wave_dma_half_flag = 0U;
     wave_dma_full_flag = 0U;
