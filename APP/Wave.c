@@ -5,7 +5,6 @@
 #include "ui.h"
 
 #include <math.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,18 +31,14 @@ extern osMutexId_t mutex_id;
 #define WAVE_LUT_MAX_VALUE               65535U
 
 /*
- * Fixed DAC sample rate + DDS phase accumulation.
- * This is the best pure-software path for keeping high-frequency waveforms
- * smoother without editing the generated LVGL files.
+ * Rebuild one full cycle in task context and let DMA loop over it.
+ * Keep the DAC trigger rate bounded, then adapt samples-per-cycle by frequency.
  */
-#define WAVE_DAC_SAMPLE_RATE_HZ          5000000U
-
-#define WAVE_DMA_HALF_SAMPLES            1024U
-#define WAVE_DMA_BUFFER_SAMPLES          (WAVE_DMA_HALF_SAMPLES * 2U)
+#define WAVE_DAC_SAMPLE_RATE_MAX_HZ      2000000U
+#define WAVE_DAC_IDLE_SAMPLE_RATE_HZ     1000U
+#define WAVE_PERIOD_SAMPLES_MIN          16U
+#define WAVE_PERIOD_SAMPLES_MAX          1024U
 #define WAVE_CACHE_ALIGN_BYTES           32U
-
-#define WAVE_TRANSITION_TIME_MS          2U
-#define WAVE_TRANSITION_SAMPLES          ((WAVE_DAC_SAMPLE_RATE_HZ / 1000U) * WAVE_TRANSITION_TIME_MS)
 
 #define WAVE_UI_POLL_PERIOD_MS           10U
 #define WAVE_UI_STARTUP_DELAY_MS         200U
@@ -56,21 +51,24 @@ static uint16_t wave_shape_lut[WAVE_TYPE_COUNT][WAVE_LUT_SIZE];
 static void *wave_dma_buffer_raw = NULL;
 static uint16_t *wave_dma_buffer = NULL;
 
-static volatile WaveType_t wave_current_type = WAVE_TYPE_NONE;
 static volatile WaveType_t wave_requested_type = WAVE_TYPE_NONE;
+static WaveType_t wave_active_type = WAVE_TYPE_NONE;
 
-static volatile WaveType_t wave_transition_from = WAVE_TYPE_NONE;
-static volatile WaveType_t wave_transition_to = WAVE_TYPE_NONE;
-static volatile uint32_t wave_transition_progress = 0U;
-static volatile uint8_t wave_transition_active = 0U;
+static volatile uint32_t wave_requested_freq_hz = WAVE_DEFAULT_OUTPUT_FREQ_HZ;
+static volatile uint32_t wave_requested_vpp_mv = WAVE_DEFAULT_OUTPUT_VPP_MV;
+static uint32_t wave_active_freq_hz = 0U;
+static uint32_t wave_active_vpp_mv = 0U;
 
-static uint32_t wave_phase_accumulator = 0U;
-static volatile uint32_t wave_phase_step = 0U;
-static volatile uint32_t wave_output_freq_hz = WAVE_DEFAULT_OUTPUT_FREQ_HZ;
-static volatile uint32_t wave_output_vpp_mv = WAVE_DEFAULT_OUTPUT_VPP_MV;
-static volatile uint16_t wave_output_peak_code = 0U;
+static uint32_t wave_output_peak_code = 0U;
+static uint32_t wave_period_sample_rate_hz = 0U;
+static uint16_t wave_period_sample_count = 0U;
+
+static volatile uint8_t wave_output_update_pending = 1U;
+static uint8_t wave_output_started = 0U;
 
 static volatile uint8_t wave_ui_apply_request = 0U;
+static volatile uint8_t wave_dma_half_flag = 0U;
+static volatile uint8_t wave_dma_full_flag = 0U;
 
 static lv_obj_t *wave_bound_change_button = NULL;
 static lv_obj_t *wave_bound_freq_textarea = NULL;
@@ -94,12 +92,28 @@ static void Wave_CopyString(char *dest, size_t dest_size, const char *src)
         return;
     }
 
-    while ((index + 1U) < dest_size && src[index] != '\0') {
+    while (((index + 1U) < dest_size) && (src[index] != '\0')) {
         dest[index] = src[index];
         index++;
     }
 
     dest[index] = '\0';
+}
+
+static void Wave_CleanDCacheRange(const void *addr, size_t size_bytes)
+{
+    uintptr_t start_addr;
+    uintptr_t end_addr;
+
+    if ((addr == NULL) || (size_bytes == 0U)) {
+        return;
+    }
+
+    start_addr = ((uintptr_t)addr) & ~(uintptr_t)(WAVE_CACHE_ALIGN_BYTES - 1U);
+    end_addr = (((uintptr_t)addr) + size_bytes + WAVE_CACHE_ALIGN_BYTES - 1U) &
+               ~(uintptr_t)(WAVE_CACHE_ALIGN_BYTES - 1U);
+
+    SCB_CleanDCache_by_Addr((uint32_t *)start_addr, (int32_t)(end_addr - start_addr));
 }
 
 static uint16_t Wave_ConvertMvToDacCode(uint32_t output_mv)
@@ -112,13 +126,9 @@ static uint16_t Wave_ConvertMvToDacCode(uint32_t output_mv)
                       WAVE_DAC_VREF_MV);
 }
 
-static uint32_t Wave_CalcPhaseStep(uint32_t output_freq_hz)
+static void Wave_RequestOutputUpdate(void)
 {
-    if (output_freq_hz > WAVE_MAX_OUTPUT_FREQ_HZ) {
-        output_freq_hz = WAVE_MAX_OUTPUT_FREQ_HZ;
-    }
-
-    return (uint32_t)(((uint64_t)output_freq_hz << 32) / WAVE_DAC_SAMPLE_RATE_HZ);
+    wave_output_update_pending = 1U;
 }
 
 static void Wave_ApplyOutputConfig(uint32_t output_freq_hz, uint32_t output_vpp_mv)
@@ -133,10 +143,11 @@ static void Wave_ApplyOutputConfig(uint32_t output_freq_hz, uint32_t output_vpp_
         output_vpp_mv = WAVE_MAX_OUTPUT_MV;
     }
 
-    wave_output_freq_hz = output_freq_hz;
-    wave_output_vpp_mv = output_vpp_mv;
-    wave_output_peak_code = Wave_ConvertMvToDacCode(output_vpp_mv);
-    wave_phase_step = Wave_CalcPhaseStep(output_freq_hz);
+    if ((wave_requested_freq_hz != output_freq_hz) || (wave_requested_vpp_mv != output_vpp_mv)) {
+        wave_requested_freq_hz = output_freq_hz;
+        wave_requested_vpp_mv = output_vpp_mv;
+        Wave_RequestOutputUpdate();
+    }
 }
 
 static void Wave_BuildSineLut(uint16_t *table)
@@ -184,7 +195,7 @@ static void Wave_InitBaseLut(void)
     Wave_BuildSquareLut(wave_shape_lut[WAVE_TYPE_SQUARE]);
 }
 
-static uint16_t Wave_GetOutputSampleFromType(WaveType_t wave_type, uint32_t phase_accumulator)
+static uint16_t Wave_GetNormalizedSampleFromType(WaveType_t wave_type, uint32_t phase_accumulator)
 {
     uint32_t index;
 
@@ -199,11 +210,7 @@ static uint16_t Wave_GetOutputSampleFromType(WaveType_t wave_type, uint32_t phas
     index = phase_accumulator >> (32U - WAVE_LUT_BITS);
 
     if (wave_type == WAVE_TYPE_SQUARE) {
-        return (uint16_t)(((uint32_t)wave_shape_lut[(uint32_t)wave_type][index &
-                                                                          WAVE_LUT_INDEX_MASK] *
-                           wave_output_peak_code +
-                           (WAVE_LUT_MAX_VALUE / 2U)) /
-                          WAVE_LUT_MAX_VALUE);
+        return wave_shape_lut[(uint32_t)wave_type][index & WAVE_LUT_INDEX_MASK];
     }
 
     {
@@ -212,20 +219,17 @@ static uint16_t Wave_GetOutputSampleFromType(WaveType_t wave_type, uint32_t phas
         const uint32_t frac = (phase_accumulator >> frac_shift) & 0xFFFFU;
         const int32_t sample_a =
             (int32_t)wave_shape_lut[(uint32_t)wave_type][index & WAVE_LUT_INDEX_MASK];
-        const int32_t sample_b =
-            (int32_t)wave_shape_lut[(uint32_t)wave_type][next_index];
+        const int32_t sample_b = (int32_t)wave_shape_lut[(uint32_t)wave_type][next_index];
         const int32_t interpolated =
             sample_a + (int32_t)(((sample_b - sample_a) * (int32_t)frac + 0x8000L) >> 16);
 
-        return (uint16_t)(((uint32_t)interpolated * wave_output_peak_code +
-                           (WAVE_LUT_MAX_VALUE / 2U)) /
-                          WAVE_LUT_MAX_VALUE);
+        return (uint16_t)interpolated;
     }
 }
 
 static HAL_StatusTypeDef Wave_AllocateDmaBuffer(void)
 {
-    const size_t buffer_bytes = WAVE_DMA_BUFFER_SAMPLES * sizeof(uint16_t);
+    const size_t buffer_bytes = WAVE_PERIOD_SAMPLES_MAX * sizeof(uint16_t);
     const size_t alloc_bytes = buffer_bytes + WAVE_CACHE_ALIGN_BYTES - 1U;
     uintptr_t aligned_addr;
 
@@ -242,71 +246,6 @@ static HAL_StatusTypeDef Wave_AllocateDmaBuffer(void)
     wave_dma_buffer = (uint16_t *)aligned_addr;
 
     return HAL_OK;
-}
-
-static void Wave_BeginTransitionIfNeeded(void)
-{
-    if (wave_transition_active != 0U) {
-        return;
-    }
-
-    if (wave_requested_type == wave_current_type) {
-        return;
-    }
-
-    wave_transition_from = wave_current_type;
-    wave_transition_to = wave_requested_type;
-    wave_transition_progress = 0U;
-    wave_transition_active = 1U;
-}
-
-static uint16_t Wave_RenderNextSample(void)
-{
-    uint16_t sample_value;
-    const uint32_t phase_accumulator = wave_phase_accumulator;
-
-    Wave_BeginTransitionIfNeeded();
-
-    if (wave_transition_active != 0U) {
-        const uint32_t blend_step = wave_transition_progress + 1U;
-        const uint32_t weight_to = blend_step;
-        const uint32_t weight_from = WAVE_TRANSITION_SAMPLES - blend_step;
-        const uint32_t from_sample = Wave_GetOutputSampleFromType(wave_transition_from,
-                                                                  phase_accumulator);
-        const uint32_t to_sample = Wave_GetOutputSampleFromType(wave_transition_to,
-                                                                phase_accumulator);
-
-        sample_value = (uint16_t)((weight_from * from_sample + weight_to * to_sample +
-                                   (WAVE_TRANSITION_SAMPLES / 2U)) /
-                                  WAVE_TRANSITION_SAMPLES);
-
-        wave_transition_progress = blend_step;
-
-        if (blend_step >= WAVE_TRANSITION_SAMPLES) {
-            wave_transition_active = 0U;
-            wave_transition_progress = 0U;
-            wave_current_type = wave_transition_to;
-        }
-    } else {
-        sample_value = Wave_GetOutputSampleFromType(wave_current_type, phase_accumulator);
-    }
-
-    if ((wave_transition_active != 0U) ||
-        (wave_current_type != WAVE_TYPE_NONE) ||
-        (wave_requested_type != WAVE_TYPE_NONE)) {
-        wave_phase_accumulator += wave_phase_step;
-    }
-
-    return sample_value;
-}
-
-static void Wave_FillBufferSection(uint16_t *dest, uint32_t sample_count)
-{
-    for (uint32_t i = 0U; i < sample_count; ++i) {
-        dest[i] = Wave_RenderNextSample();
-    }
-
-    SCB_CleanDCache_by_Addr((uint32_t *)dest, (int32_t)(sample_count * sizeof(uint16_t)));
 }
 
 static uint32_t Wave_GetTim6ClockHz(void)
@@ -370,6 +309,151 @@ static HAL_StatusTypeDef Wave_ConfigTim6ForSampleRate(uint32_t sample_rate_hz)
     return HAL_OK;
 }
 
+static void Wave_DisableRegularDmaInterrupts(void)
+{
+    if (hdac1.DMA_Handle1 == NULL) {
+        return;
+    }
+
+    __HAL_DMA_DISABLE_IT(hdac1.DMA_Handle1, DMA_IT_HT);
+    __HAL_DMA_DISABLE_IT(hdac1.DMA_Handle1, DMA_IT_TC);
+}
+
+static void Wave_StopOutput(void)
+{
+    (void)HAL_TIM_Base_Stop(&htim6);
+    (void)HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
+}
+
+static void Wave_BuildOutputPlan(WaveType_t wave_type,
+                                 uint32_t output_freq_hz,
+                                 uint32_t *sample_rate_hz,
+                                 uint16_t *sample_count)
+{
+    uint32_t planned_samples;
+
+    if ((sample_rate_hz == NULL) || (sample_count == NULL)) {
+        return;
+    }
+
+    if (wave_type == WAVE_TYPE_NONE) {
+        *sample_count = WAVE_PERIOD_SAMPLES_MIN;
+        *sample_rate_hz = WAVE_DAC_IDLE_SAMPLE_RATE_HZ;
+        return;
+    }
+
+    if (output_freq_hz < WAVE_MIN_OUTPUT_FREQ_HZ) {
+        output_freq_hz = WAVE_MIN_OUTPUT_FREQ_HZ;
+    } else if (output_freq_hz > WAVE_MAX_OUTPUT_FREQ_HZ) {
+        output_freq_hz = WAVE_MAX_OUTPUT_FREQ_HZ;
+    }
+
+    planned_samples = WAVE_DAC_SAMPLE_RATE_MAX_HZ / output_freq_hz;
+    if (planned_samples > WAVE_PERIOD_SAMPLES_MAX) {
+        planned_samples = WAVE_PERIOD_SAMPLES_MAX;
+    }
+    if (planned_samples < WAVE_PERIOD_SAMPLES_MIN) {
+        planned_samples = WAVE_PERIOD_SAMPLES_MIN;
+    }
+
+    *sample_count = (uint16_t)planned_samples;
+    *sample_rate_hz = output_freq_hz * planned_samples;
+}
+
+static HAL_StatusTypeDef Wave_BuildPeriodBuffer(WaveType_t wave_type,
+                                                uint32_t output_vpp_mv,
+                                                uint16_t sample_count)
+{
+    const uint16_t peak_code = Wave_ConvertMvToDacCode(output_vpp_mv);
+
+    if ((wave_dma_buffer == NULL) || (sample_count == 0U) ||
+        (sample_count > WAVE_PERIOD_SAMPLES_MAX)) {
+        return HAL_ERROR;
+    }
+
+    for (uint32_t i = 0U; i < sample_count; ++i) {
+        const uint32_t phase_accumulator =
+            (uint32_t)(((uint64_t)i << 32) / (uint64_t)sample_count);
+        const uint16_t normalized_sample =
+            Wave_GetNormalizedSampleFromType(wave_type, phase_accumulator);
+
+        wave_dma_buffer[i] = (uint16_t)(((uint32_t)normalized_sample * peak_code +
+                                         (WAVE_LUT_MAX_VALUE / 2U)) /
+                                        WAVE_LUT_MAX_VALUE);
+    }
+
+    Wave_CleanDCacheRange(wave_dma_buffer, (size_t)sample_count * sizeof(uint16_t));
+    wave_output_peak_code = peak_code;
+
+    return HAL_OK;
+}
+
+static void Wave_ProcessPendingOutputUpdate(void)
+{
+    WaveType_t requested_type;
+    uint32_t requested_freq_hz;
+    uint32_t requested_vpp_mv;
+    uint32_t sample_rate_hz = 0U;
+    uint16_t sample_count = 0U;
+
+    requested_type = wave_requested_type;
+    requested_freq_hz = wave_requested_freq_hz;
+    requested_vpp_mv = wave_requested_vpp_mv;
+
+    if ((wave_output_started != 0U) &&
+        (wave_output_update_pending == 0U) &&
+        (requested_type == wave_active_type) &&
+        (requested_freq_hz == wave_active_freq_hz) &&
+        (requested_vpp_mv == wave_active_vpp_mv)) {
+        return;
+    }
+
+    wave_output_update_pending = 0U;
+
+    Wave_BuildOutputPlan(requested_type, requested_freq_hz, &sample_rate_hz, &sample_count);
+
+    Wave_StopOutput();
+
+    if (Wave_BuildPeriodBuffer(requested_type, requested_vpp_mv, sample_count) != HAL_OK) {
+        Error_Handler();
+    }
+
+    if (Wave_ConfigTim6ForSampleRate(sample_rate_hz) != HAL_OK) {
+        Error_Handler();
+    }
+
+    if (HAL_DAC_Start_DMA(&hdac1,
+                          DAC_CHANNEL_1,
+                          (uint32_t *)wave_dma_buffer,
+                          sample_count,
+                          DAC_ALIGN_12B_R) != HAL_OK) {
+        Error_Handler();
+    }
+
+    Wave_DisableRegularDmaInterrupts();
+
+    if (HAL_TIM_Base_Start(&htim6) != HAL_OK) {
+        Error_Handler();
+    }
+
+    wave_active_type = requested_type;
+    wave_active_freq_hz = requested_freq_hz;
+    wave_active_vpp_mv = requested_vpp_mv;
+    wave_period_sample_rate_hz = sample_rate_hz;
+    wave_period_sample_count = sample_count;
+    wave_output_started = 1U;
+    wave_dma_half_flag = 0U;
+    wave_dma_full_flag = 0U;
+}
+
+static void Wave_ClearDmaTransferFlags(void)
+{
+    if ((wave_dma_half_flag != 0U) || (wave_dma_full_flag != 0U)) {
+        wave_dma_half_flag = 0U;
+        wave_dma_full_flag = 0U;
+    }
+}
+
 static void Wave_StartOutput(void)
 {
     Wave_InitBaseLut();
@@ -378,36 +462,21 @@ static void Wave_StartOutput(void)
         Error_Handler();
     }
 
-    Wave_ApplyOutputConfig(WAVE_DEFAULT_OUTPUT_FREQ_HZ, WAVE_DEFAULT_OUTPUT_VPP_MV);
-
-    wave_phase_accumulator = 0U;
-    wave_current_type = WAVE_TYPE_NONE;
     wave_requested_type = WAVE_TYPE_NONE;
-    wave_transition_from = WAVE_TYPE_NONE;
-    wave_transition_to = WAVE_TYPE_NONE;
-    wave_transition_progress = 0U;
-    wave_transition_active = 0U;
+    wave_active_type = WAVE_TYPE_NONE;
+    wave_requested_freq_hz = WAVE_DEFAULT_OUTPUT_FREQ_HZ;
+    wave_requested_vpp_mv = WAVE_DEFAULT_OUTPUT_VPP_MV;
+    wave_active_freq_hz = 0U;
+    wave_active_vpp_mv = 0U;
+    wave_output_peak_code = 0U;
+    wave_period_sample_rate_hz = 0U;
+    wave_period_sample_count = 0U;
+    wave_output_started = 0U;
+    wave_output_update_pending = 1U;
+    wave_dma_half_flag = 0U;
+    wave_dma_full_flag = 0U;
 
-    Wave_FillBufferSection(wave_dma_buffer, WAVE_DMA_BUFFER_SAMPLES);
-
-    (void)HAL_TIM_Base_Stop(&htim6);
-    (void)HAL_DAC_Stop_DMA(&hdac1, DAC_CHANNEL_1);
-
-    if (Wave_ConfigTim6ForSampleRate(WAVE_DAC_SAMPLE_RATE_HZ) != HAL_OK) {
-        Error_Handler();
-    }
-
-    if (HAL_DAC_Start_DMA(&hdac1,
-                          DAC_CHANNEL_1,
-                          (uint32_t *)wave_dma_buffer,
-                          WAVE_DMA_BUFFER_SAMPLES,
-                          DAC_ALIGN_12B_R) != HAL_OK) {
-        Error_Handler();
-    }
-
-    if (HAL_TIM_Base_Start(&htim6) != HAL_OK) {
-        Error_Handler();
-    }
+    Wave_ProcessPendingOutputUpdate();
 }
 
 static uint8_t Wave_ReadTypeFromUi(WaveType_t *selected_type)
@@ -588,8 +657,8 @@ static void Wave_ProcessUiApplyRequest(void)
 {
     char freq_text[WAVE_FREQ_TEXT_BUFFER_SIZE];
     char vpp_text[WAVE_VPP_TEXT_BUFFER_SIZE];
-    uint32_t freq_hz = wave_output_freq_hz;
-    uint32_t vpp_mv = wave_output_vpp_mv;
+    uint32_t freq_hz = wave_requested_freq_hz;
+    uint32_t vpp_mv = wave_requested_vpp_mv;
     uint8_t freq_valid = 0U;
     uint8_t vpp_valid = 0U;
 
@@ -608,12 +677,6 @@ static void Wave_ProcessUiApplyRequest(void)
     Wave_CopyString(vpp_text, sizeof(vpp_text), lv_textarea_get_text(ui_TextAreaVPP));
     osMutexRelease(mutex_id);
 
-    /*
-     * FREQ 和 VPP 两个输入框彼此独立：
-     * - 某个输入框为空：保持当前参数不变
-     * - 某个输入框非空且合法：只更新这个参数
-     * - 某个输入框非空但非法：忽略这个输入框，不影响另一个合法输入框生效
-     */
     if (freq_text[0] != '\0') {
         freq_valid = Wave_ParseFreqText(freq_text, &freq_hz);
     }
@@ -636,11 +699,17 @@ void Wave_SetWaveType(WaveType_t wave_type)
     case WAVE_TYPE_TRIANGLE:
     case WAVE_TYPE_SQUARE:
     case WAVE_TYPE_NONE:
-        wave_requested_type = wave_type;
+        if (wave_requested_type != wave_type) {
+            wave_requested_type = wave_type;
+            Wave_RequestOutputUpdate();
+        }
         break;
 
     default:
-        wave_requested_type = WAVE_TYPE_NONE;
+        if (wave_requested_type != WAVE_TYPE_NONE) {
+            wave_requested_type = WAVE_TYPE_NONE;
+            Wave_RequestOutputUpdate();
+        }
         break;
     }
 }
@@ -652,20 +721,16 @@ WaveType_t Wave_GetWaveType(void)
 
 void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 {
-    if ((hdac == NULL) || (hdac->Instance != DAC1) || (wave_dma_buffer == NULL)) {
-        return;
+    if ((hdac != NULL) && (hdac->Instance == DAC1)) {
+        wave_dma_half_flag = 1U;
     }
-
-    Wave_FillBufferSection(&wave_dma_buffer[0], WAVE_DMA_HALF_SAMPLES);
 }
 
 void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 {
-    if ((hdac == NULL) || (hdac->Instance != DAC1) || (wave_dma_buffer == NULL)) {
-        return;
+    if ((hdac != NULL) && (hdac->Instance == DAC1)) {
+        wave_dma_full_flag = 1U;
     }
-
-    Wave_FillBufferSection(&wave_dma_buffer[WAVE_DMA_HALF_SAMPLES], WAVE_DMA_HALF_SAMPLES);
 }
 
 void HAL_DAC_ErrorCallbackCh1(DAC_HandleTypeDef *hdac)
@@ -692,6 +757,8 @@ void DACStartTask(void *argument)
         Wave_BindUiControlsIfNeeded();
         Wave_PollUiSelection();
         Wave_ProcessUiApplyRequest();
+        Wave_ProcessPendingOutputUpdate();
+        Wave_ClearDmaTransferFlags();
         osDelay(WAVE_UI_POLL_PERIOD_MS);
     }
 }
