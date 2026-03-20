@@ -40,7 +40,7 @@ extern osMessageQueueId_t wifiRxQueueHandle;
 extern uint8_t wifiRxBuf[WIFI_RX_BUF_SIZE];
 extern uint16_t wifiRxLen;
 extern volatile uint32_t uart4_rx_isr_count;
-extern volatile uint32_t wifi_rx_task_count;
+extern volatile uint32_t wifi_rx_task_count; //123123123
 
 /**
  * @brief WiFi任务入口函数
