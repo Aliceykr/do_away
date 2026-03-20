@@ -1,7 +1,6 @@
 #include "Wave.h"
 
 #include "FreeRTOS.h"
-#include "portable.h"
 #include "ui.h"
 
 #include <math.h>
@@ -47,9 +46,8 @@ extern osMutexId_t mutex_id;
 #define WAVE_VPP_TEXT_BUFFER_SIZE        16U
 
 static uint16_t wave_shape_lut[WAVE_TYPE_COUNT][WAVE_LUT_SIZE];
-
-static void *wave_dma_buffer_raw = NULL;
-static uint16_t *wave_dma_buffer = NULL;
+static uint16_t wave_dma_buffer[WAVE_PERIOD_SAMPLES_MAX]
+    __attribute__((section("WAVE_DMA_D2"), aligned(WAVE_CACHE_ALIGN_BYTES)));
 
 static volatile WaveType_t wave_requested_type = WAVE_TYPE_NONE;
 static WaveType_t wave_active_type = WAVE_TYPE_NONE;
@@ -81,11 +79,6 @@ typedef struct
     uint32_t period_counts;
     uint16_t sample_count;
 } WaveOutputPlan_t;
-
-static uintptr_t Wave_AlignUp(uintptr_t value, uintptr_t alignment)
-{
-    return (value + alignment - 1U) & ~(alignment - 1U);
-}
 
 static void Wave_CopyString(char *dest, size_t dest_size, const char *src)
 {
@@ -233,27 +226,6 @@ static uint16_t Wave_GetNormalizedSampleFromType(WaveType_t wave_type, uint32_t 
 
         return (uint16_t)interpolated;
     }
-}
-
-static HAL_StatusTypeDef Wave_AllocateDmaBuffer(void)
-{
-    const size_t buffer_bytes = WAVE_PERIOD_SAMPLES_MAX * sizeof(uint16_t);
-    const size_t alloc_bytes = buffer_bytes + WAVE_CACHE_ALIGN_BYTES - 1U;
-    uintptr_t aligned_addr;
-
-    if (wave_dma_buffer != NULL) {
-        return HAL_OK;
-    }
-
-    wave_dma_buffer_raw = pvPortMalloc(alloc_bytes);
-    if (wave_dma_buffer_raw == NULL) {
-        return HAL_ERROR;
-    }
-
-    aligned_addr = Wave_AlignUp((uintptr_t)wave_dma_buffer_raw, WAVE_CACHE_ALIGN_BYTES);
-    wave_dma_buffer = (uint16_t *)aligned_addr;
-
-    return HAL_OK;
 }
 
 static uint32_t Wave_GetTim6ClockHz(void)
@@ -451,8 +423,7 @@ static HAL_StatusTypeDef Wave_BuildPeriodBuffer(WaveType_t wave_type,
 {
     const uint16_t peak_code = Wave_ConvertMvToDacCode(output_vpp_mv);
 
-    if ((wave_dma_buffer == NULL) || (sample_count == 0U) ||
-        (sample_count > WAVE_PERIOD_SAMPLES_MAX)) {
+    if ((sample_count == 0U) || (sample_count > WAVE_PERIOD_SAMPLES_MAX)) {
         return HAL_ERROR;
     }
 
@@ -543,10 +514,6 @@ static void Wave_ClearDmaTransferFlags(void)
 static void Wave_StartOutput(void)
 {
     Wave_InitBaseLut();
-
-    if (Wave_AllocateDmaBuffer() != HAL_OK) {
-        Error_Handler();
-    }
 
     wave_requested_type = WAVE_TYPE_NONE;
     wave_active_type = WAVE_TYPE_NONE;
