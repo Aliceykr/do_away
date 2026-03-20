@@ -1,58 +1,219 @@
-# STM32H750 RGB LCD + LVGL + WiFi + Wave Control
+# STM32H750 RGB LCD + LVGL + WiFi + 波形控制工程
 
-This repository contains an STM32H750-based embedded application with:
+这是一个基于 `STM32H750XBH6` 的嵌入式应用工程，当前集成了：
 
-- FreeRTOS task scheduling
-- LVGL 8.4 user interface
-- 800x480 RGB LCD display
-- GT911 touch input
-- UART4-based WiFi interaction
-- Waveform control UI reserved for an external generator backend
+- `FreeRTOS` 多任务调度
+- `LVGL 8.4` 图形界面
+- `800x480 RGB LCD` 显示
+- `GT911` 触摸输入
+- `UART4` WiFi 交互
+- 波形页面 UI 与参数控制接口
 
-## Current waveform status
+本分支当前名称为：
 
-The waveform UI path is still present, but the old on-chip DAC waveform generation logic has been removed.
+- `AD9833来提供波形输出方案`
 
-Current `APP/Wave.c` behavior:
+这个分支的核心目标不是继续优化片上 DAC 出波，而是把原来的波形输出路径拆开，先保留界面和软件接口，再逐步迁移到 `AD9833` 外部波形发生器方案。
 
-- keeps the waveform type selection interface
-- keeps the frequency and Vpp text input parsing
-- keeps the `CHANGE` button handling
-- keeps the `DACStartTask` task entry so the UI flow is unchanged
-- leaves a placeholder function for future AD9833 output logic
+## 当前分支定位
 
-What is not active now:
+当前分支已经完成的事情是：
 
-- no DAC DMA waveform streaming
-- no TIM6-based waveform sample scheduling inside `APP/Wave.c`
-- no DMA half/full refill logic
-- no waveform LUT/NCO/DDS generation path
+- 保留了波形页面的 LVGL 控件接口
+- 保留了波形类型选择逻辑
+- 保留了频率输入与 `Vpp` 输入解析逻辑
+- 保留了 `CHANGE` 按钮触发参数更新的流程
+- 保留了 `Wave.c / Wave.h` 作为统一的波形控制模块入口
+- 在 `Wave.c` 中预留了后续接入 `AD9833` 的硬件输出占位函数
 
-Important note:
+当前分支还没有完成的事情是：
 
-- CubeMX-generated DAC, DMA, and timer initialization code may still exist in the project
-- the related task and public interfaces are intentionally preserved for the later AD9833 migration
-- the AD9833 hardware output logic has not been implemented yet
+- 还没有真正写入 `AD9833` 的寄存器配置逻辑
+- 还没有完成对所有历史 `DAC / TIM6 / DMA / DACTas` 残留配置的最终清理
 
-## Main files
+也就是说，这个分支目前处在“软件接口先稳住，底层硬件方案正在切换”的阶段。
+
+## 和 main 分支的核心区别
+
+`main` 分支与当前分支最本质的差异，不是界面长相，而是“波形是怎么出来的”。
+
+### main 分支
+
+`main` 分支使用的是 STM32 片上 DAC 出波方案，大体路径是：
+
+`LVGL 参数 -> Wave.c -> LUT / NCO / DDS -> DMA 缓冲 -> DAC1 -> TIM6 触发输出`
+
+它的特点是：
+
+- 波形由 MCU 在本地生成
+- 使用 `DAC1 + TIM6 + DMA`
+- 使用 LUT 查表、相位累加、DMA 双半缓冲补数
+- 原来还为波形 DMA 缓冲单独预留了 `D2 SRAM`
+- `DACTas` 线程承担了波形更新与流式缓冲维护工作
+
+简单说，`main` 分支里，STM32 本身既负责“算波形”，又负责“推波形到 DAC 输出”。
+
+### 当前分支
+
+当前分支的思路变成了：
+
+`LVGL 参数 -> Wave.c -> 参数整理 / 状态保存 -> 预留 AD9833 后端`
+
+它的特点是：
+
+- 不再在 `Wave.c` 里生成片上 DAC 波形数据
+- 不再保留 LUT/NCO/DDS 造波逻辑
+- 不再保留 DMA 半缓冲/全缓冲回填逻辑
+- 不再保留为片上 DAC 出波准备的 D2 SRAM 数据区预留
+- 重点改成“保留 UI 和控制接口，等待接入 AD9833”
+
+简单说，当前分支里，STM32 暂时只负责“读界面参数、整理参数、准备发给外部波形芯片”，不再负责在 `Wave.c` 里自己算出 DAC 采样流。
+
+## 与 main 分支的详细差异对照
+
+| 对比项 | `main` 分支 | 当前 `AD9833来提供波形输出方案` 分支 |
+| --- | --- | --- |
+| 波形输出方式 | 片上 `DAC1` 输出 | 计划迁移到 `AD9833` |
+| 波形生成位置 | `Wave.c` 内部生成采样数据 | `Wave.c` 只保留参数处理与后端占位 |
+| 定时触发 | `TIM6` 触发 DAC 更新 | 当前 `Wave.c` 已不再使用该出波路径 |
+| DMA | 使用 DAC DMA 循环搬运采样数据 | 当前 `Wave.c` 已移除 DMA 流式补数逻辑 |
+| LUT / DDS | 有 | 已移除 |
+| D2 SRAM 波形缓冲 | 有专用预留 | 已清理掉相关预留 |
+| UI 控件 | 有 | 保留 |
+| SwitchA/B/C | 有 | 保留 |
+| 频率输入框 | 有 | 保留 |
+| `Vpp` 输入框 | 有 | 保留 |
+| `CHANGE` 按钮 | 有 | 保留 |
+| 硬件输出后端 | DAC 已实现 | AD9833 尚未实现，当前留空 |
+
+## 当前分支里保留了什么
+
+当前分支特意保留下来的内容，主要是为了不动你现有界面和交互层：
 
 - `APP/Wave.c`
-  - waveform UI state handling
-  - waveform parameter parsing
-  - future hardware backend placeholder
+  - 保留波形类型状态管理
+  - 保留频率和 `Vpp` 文本解析
+  - 保留 `CHANGE` 按钮事件处理
+  - 保留与 LVGL 控件的绑定逻辑
+  - 保留统一的硬件输出适配入口
 - `APP/Wave.h`
-  - public waveform interface
-- `APP/wifi.c`
-  - WiFi task logic and UART interaction
+  - 保留对外接口定义
+- `DACStartTask`
+  - 当前仍作为波形控制任务入口存在
+  - 但作用已经从“驱动 DAC 连续出波”变成“轮询 UI、整理参数、等待后端接管”
+
+保留这些东西的原因是：
+
+- 不破坏现有 LVGL 页面
+- 不破坏 `main.c` 里已有的模块调用关系
+- 后续接入 `AD9833` 时，不需要重做页面和上层控制逻辑
+
+## 当前分支里已经去掉了什么
+
+相对于 `main` 分支，当前分支已经移除或停用的部分主要包括：
+
+- `Wave.c` 中片上 DAC 波形生成逻辑
+- 基于 LUT 的正弦波 / 三角波 / 方波采样生成
+- NCO / DDS 相位累加路径
+- DMA half/full 回调驱动的缓冲续填逻辑
+- `HAL_DAC_Start_DMA()` 和对应的流式出波链路
+- 为波形 DMA 缓冲设置的 D2 SRAM 专用内存区预留
+- scatter 文件中的 `WAVE_DMA_D2` 专用段
+
+这意味着当前分支已经不再走“本地生成大量采样点并连续灌给 DAC”的路线。
+
+## 当前波形模块的实际工作方式
+
+当前 `APP/Wave.c` 的职责可以概括成四步：
+
+1. 读取 UI 控件
+   - 读取 `SwitchA / SwitchB / SwitchC`
+   - 读取频率文本框
+   - 读取 `Vpp` 文本框
+
+2. 解析并约束参数
+   - 频率范围约束为 `10 Hz ~ 100 kHz`
+   - `Vpp` 目前按 `0 ~ 3.0 Vpp` 解析
+
+3. 保存成统一状态
+   - 保存“用户请求的波形类型”
+   - 保存“用户请求的频率和 Vpp”
+   - 保存“已应用的参数快照”
+
+4. 调用后端适配入口
+   - 当前入口已经留好
+   - 但内部还是空实现
+   - 后续 AD9833 接入时，建议直接在这个入口补硬件逻辑
+
+## 当前代码状态要特别注意的点
+
+虽然 `Wave.c` 里的 DAC 出波逻辑已经去掉了，但这不等于整个工程已经完全和 DAC 无关。
+
+截至目前，这个分支要分清楚两层状态：
+
+### 已经清理掉的
+
+- `Wave.c` 里的 DAC 采样流生成逻辑
+- 波形 DMA 专用的 D2 SRAM 预留
+- scatter 文件里的波形 DMA 专用段
+
+### 可能还会继续清理的
+
+- CubeMX 生成的 `DAC1` 初始化
+- `TIM6` 初始化
+- 与 DAC 绑定的普通 DMA 配置
+- `DACTas` 线程的最终去留
+- 一些为了兼容原工程而暂时保留的空回调
+
+所以当前分支更准确的状态是：
+
+- “波形软件路径已经切到 AD9833 迁移模式”
+- “部分底层工程配置还可能在后续继续做收尾”
+
+## 推荐的后续开发路径
+
+如果后续继续沿这个分支往下做，比较合理的顺序是：
+
+1. 完成 `AD9833` 的硬件控制逻辑
+   - 在 `APP/Wave.c` 的后端占位函数中实现
+   - 把波形类型、频率等参数真正转换成 AD9833 配置
+
+2. 确认 AD9833 方案稳定后，再彻底清理旧 DAC 方案残留
+   - 删掉不再需要的 `DAC1 / TIM6 / DMA` 配置
+   - 评估是否还需要保留 `DACTas`
+
+3. 保持 LVGL 页面接口不变
+   - 这样上层 UI 不用返工
+   - 也能避免把硬件切换影响扩散到界面层
+
+## 相关文件说明
+
+- `APP/Wave.c`
+  - 当前分支中最关键的迁移文件
+  - 负责 UI 参数采集、状态管理和 AD9833 后端占位
+- `APP/Wave.h`
+  - 波形控制模块的对外接口头文件
 - `Core/Src/main.c`
-  - system startup and task creation
+  - 系统初始化与任务创建入口
+- `MDK-ARM/STM32H750XBH6/STM32H750XBH6.sct`
+  - 工程的 scatter file
+  - 当前已移除波形 DMA 专用内存区
 
-## Build environment
+## 构建环境
 
-- MCU: `STM32H750XBH6`
-- IDE/project: `MDK-ARM/STM32H750XBH6.uvprojx`
-- Frameworks: STM32 HAL, CMSIS, FreeRTOS, LVGL 8.4
+- MCU：`STM32H750XBH6`
+- 工程：`MDK-ARM/STM32H750XBH6.uvprojx`
+- 主要软件栈：
+  - STM32 HAL
+  - CMSIS
+  - FreeRTOS
+  - LVGL 8.4
 
-## Development note
+## 总结
 
-If you continue the waveform migration, the intended next step is to implement the AD9833 backend inside `APP/Wave.c` by filling in the placeholder hardware output function, while keeping the existing LVGL-facing interfaces unchanged.
+如果用一句话概括当前分支和 `main` 的区别：
+
+`main` 分支是“STM32 自己用 DAC 直接造波并输出”，  
+当前 `AD9833来提供波形输出方案` 分支是“先保留页面和控制接口，移除片上 DAC 造波逻辑，准备改成由 AD9833 负责输出波形”。
+
+所以这个分支的重点不是“继续把 DAC 做得更强”，而是“把波形控制层和具体输出硬件解耦，为 AD9833 接管输出做准备”。

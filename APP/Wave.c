@@ -6,8 +6,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * 波形控制模块当前只保留“UI 参数采集 + 参数状态管理 + 后端占位接口”。
+ * 原来的片上 DAC / DMA / TIM6 波形生成逻辑已经移除，后续可以在
+ * Wave_ApplyOutputToHardware() 中接入 AD9833 实现，而不需要改动 LVGL 页面接口。
+ */
 extern osMutexId_t mutex_id;
 
+/* 默认值与输入范围约束，直接对应当前 UI 的使用范围。 */
 #define WAVE_DEFAULT_OUTPUT_FREQ_HZ    1000U
 #define WAVE_DEFAULT_OUTPUT_VPP_MV     3000U
 #define WAVE_MIN_OUTPUT_FREQ_HZ        10U
@@ -15,28 +21,38 @@ extern osMutexId_t mutex_id;
 
 #define WAVE_MAX_OUTPUT_MV             3000U
 
+/* 任务调度参数：控制 UI 轮询节奏和任务空闲延时。 */
 #define WAVE_UI_POLL_PERIOD_MS         10U
 #define WAVE_UI_STARTUP_DELAY_MS       200U
 #define WAVE_TASK_IDLE_DELAY_MS        1U
 
+/* 文本框内容的本地缓存大小。 */
 #define WAVE_FREQ_TEXT_BUFFER_SIZE     16U
 #define WAVE_VPP_TEXT_BUFFER_SIZE      16U
 
+/* 用户刚刚通过 UI 请求的目标波形类型。 */
 static volatile WaveType_t wave_requested_type = WAVE_TYPE_NONE;
+/* 已经下发到硬件后端的波形类型快照。 */
 static WaveType_t wave_active_type = WAVE_TYPE_NONE;
 
+/* 用户通过输入框提交的目标频率和目标 Vpp。 */
 static volatile uint32_t wave_requested_freq_hz = WAVE_DEFAULT_OUTPUT_FREQ_HZ;
 static volatile uint32_t wave_requested_vpp_mv = WAVE_DEFAULT_OUTPUT_VPP_MV;
+/* 已经应用到后端的频率和 Vpp 快照。 */
 static uint32_t wave_active_freq_hz = 0U;
 static uint32_t wave_active_vpp_mv = 0U;
 
+/* 标记是否存在待应用到硬件的新参数。 */
 static volatile uint8_t wave_output_update_pending = 1U;
+/* 由 CHANGE 按钮事件置位，表示需要读取并应用输入框内容。 */
 static volatile uint8_t wave_ui_apply_request = 0U;
 
+/* 记录已经绑定过的 LVGL 控件，避免重复注册事件和重复设置属性。 */
 static lv_obj_t *wave_bound_change_button = NULL;
 static lv_obj_t *wave_bound_freq_textarea = NULL;
 static lv_obj_t *wave_bound_vpp_textarea = NULL;
 
+/* 安全复制 LVGL 返回的字符串，避免空指针和越界。 */
 static void Wave_CopyString(char *dest, size_t dest_size, const char *src)
 {
     size_t index = 0U;
@@ -58,11 +74,13 @@ static void Wave_CopyString(char *dest, size_t dest_size, const char *src)
     dest[index] = '\0';
 }
 
+/* 标记存在新的输出参数，等待主流程统一下发。 */
 static void Wave_RequestOutputUpdate(void)
 {
     wave_output_update_pending = 1U;
 }
 
+/* 对频率和 Vpp 做范围约束，再更新“用户请求值”。 */
 static void Wave_ApplyOutputConfig(uint32_t output_freq_hz, uint32_t output_vpp_mv)
 {
     if (output_freq_hz < WAVE_MIN_OUTPUT_FREQ_HZ) {
@@ -83,9 +101,9 @@ static void Wave_ApplyOutputConfig(uint32_t output_freq_hz, uint32_t output_vpp_
 }
 
 /*
- * Keep the UI-to-backend handoff in one place. The legacy on-chip DAC waveform
- * generator has been removed, so this function is intentionally empty until the
- * AD9833 backend is added.
+ * 统一的硬件输出适配点。
+ * 以后接 AD9833 时，建议只在这里补硬件访问逻辑，
+ * 这样上层 UI 与参数处理代码都不需要再改。
  */
 static void Wave_ApplyOutputToHardware(WaveType_t wave_type,
                                        uint32_t output_freq_hz,
@@ -95,10 +113,13 @@ static void Wave_ApplyOutputToHardware(WaveType_t wave_type,
     (void)output_freq_hz;
     (void)output_vpp_mv;
 
-    /* Reserved for future AD9833 waveform output implementation. */
+    /* 预留给后续 AD9833 波形输出实现。 */
 }
 
-/* Apply the latest UI-selected waveform parameters to the future hardware backend. */
+/*
+ * 把最新的请求参数同步到“已应用参数”，
+ * 然后统一调用底层硬件输出接口。
+ */
 static void Wave_ProcessPendingOutputUpdate(void)
 {
     WaveType_t requested_type;
@@ -125,6 +146,7 @@ static void Wave_ProcessPendingOutputUpdate(void)
     Wave_ApplyOutputToHardware(requested_type, requested_freq_hz, requested_vpp_mv);
 }
 
+/* 初始化模块状态，确保任务刚启动时处于“关闭输出”的安全状态。 */
 static void Wave_StartOutput(void)
 {
     wave_requested_type = WAVE_TYPE_NONE;
@@ -139,6 +161,7 @@ static void Wave_StartOutput(void)
     Wave_ProcessPendingOutputUpdate();
 }
 
+/* 从三个波形选择开关中读取当前选中的波形类型。 */
 static uint8_t Wave_ReadTypeFromUi(WaveType_t *selected_type)
 {
     uint8_t found = 0U;
@@ -169,6 +192,7 @@ static uint8_t Wave_ReadTypeFromUi(WaveType_t *selected_type)
     return found;
 }
 
+/* 周期性读取开关状态，并更新目标波形类型。 */
 static void Wave_PollUiSelection(void)
 {
     WaveType_t selected_type;
@@ -178,6 +202,7 @@ static void Wave_PollUiSelection(void)
     }
 }
 
+/* CHANGE 按钮点击后只置位标志，真正处理放到任务上下文。 */
 static void Wave_ChangeButtonEvent(lv_event_t *e)
 {
     if ((e != NULL) && (lv_event_get_code(e) == LV_EVENT_CLICKED)) {
@@ -185,7 +210,10 @@ static void Wave_ChangeButtonEvent(lv_event_t *e)
     }
 }
 
-/* Preserve the existing LVGL control bindings so AD9833 can reuse them later. */
+/*
+ * 绑定波形页面控件，并设置输入框约束。
+ * 这些 LVGL 接口后续会直接复用给 AD9833。
+ */
 static void Wave_BindUiControlsIfNeeded(void)
 {
     if (mutex_id == NULL) {
@@ -231,6 +259,7 @@ static void Wave_BindUiControlsIfNeeded(void)
     osMutexRelease(mutex_id);
 }
 
+/* 解析频率输入框，要求输入纯数字，范围为 10 Hz 到 100 kHz。 */
 static uint8_t Wave_ParseFreqText(const char *text, uint32_t *freq_hz)
 {
     uint32_t value = 0U;
@@ -258,6 +287,7 @@ static uint8_t Wave_ParseFreqText(const char *text, uint32_t *freq_hz)
     return 1U;
 }
 
+/* 解析 Vpp 输入框，支持形如 1、1.2、3.000 的文本输入。 */
 static uint8_t Wave_ParseVppText(const char *text, uint32_t *vpp_mv)
 {
     uint32_t integer_part = 0U;
@@ -314,6 +344,7 @@ static uint8_t Wave_ParseVppText(const char *text, uint32_t *vpp_mv)
     return 1U;
 }
 
+/* 在任务上下文中读取输入框文本，并把合法参数写回模块状态。 */
 static void Wave_ProcessUiApplyRequest(void)
 {
     char freq_text[WAVE_FREQ_TEXT_BUFFER_SIZE];
@@ -353,6 +384,7 @@ static void Wave_ProcessUiApplyRequest(void)
     Wave_ApplyOutputConfig(freq_hz, vpp_mv);
 }
 
+/* 对外暴露的波形类型设置接口。 */
 void Wave_SetWaveType(WaveType_t wave_type)
 {
     switch (wave_type) {
@@ -375,11 +407,13 @@ void Wave_SetWaveType(WaveType_t wave_type)
     }
 }
 
+/* 返回当前记录的目标波形类型。 */
 WaveType_t Wave_GetWaveType(void)
 {
     return wave_requested_type;
 }
 
+/* 以下 DAC 回调当前保留为空实现，仅用于兼容现有工程连接点。 */
 void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac)
 {
     (void)hdac;
@@ -401,9 +435,13 @@ void HAL_DAC_DMAUnderrunCallbackCh1(DAC_HandleTypeDef *hdac)
 }
 
 /*
- * The task is still kept alive so the existing LVGL waveform controls continue
- * to parse and store output requests. Hardware output is deferred to the future
- * AD9833 implementation.
+ * 当前任务仍然保留，目的是让现有波形页面继续正常工作：
+ * - 绑定控件
+ * - 读取开关
+ * - 解析输入框
+ * - 统一分发参数
+ *
+ * 真正的硬件输出逻辑留待后续 AD9833 接入时实现。
  */
 void DACStartTask(void *argument)
 {
@@ -422,6 +460,7 @@ void DACStartTask(void *argument)
     next_ui_poll_tick = osKernelGetTickCount();
 
     for (;;) {
+        /* 到达轮询时机后，处理一次 UI 侧的开关和输入框。 */
         if ((int32_t)(osKernelGetTickCount() - next_ui_poll_tick) >= 0) {
             Wave_BindUiControlsIfNeeded();
             Wave_PollUiSelection();
@@ -429,6 +468,7 @@ void DACStartTask(void *argument)
             next_ui_poll_tick = osKernelGetTickCount() + WAVE_UI_POLL_PERIOD_MS;
         }
 
+        /* 统一把最新参数同步到硬件后端占位接口。 */
         Wave_ProcessPendingOutputUpdate();
         osDelay(WAVE_TASK_IDLE_DELAY_MS);
     }

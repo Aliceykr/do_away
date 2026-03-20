@@ -1,19 +1,21 @@
 /**
  * @file Wave.h
- * @brief 波形输出模块对外接口
+ * @brief 波形控制模块对外接口
  *
- * 本模块负责：
- * 1. 在 DACTas 线程中启动 TIM6 + DAC + DMA 波形输出
- * 2. 根据 UI 上的 SwitchA / SwitchB / SwitchC 自动选择波形
- * 3. 在正弦波、三角波、方波之间做平滑切换
+ * 当前模块的职责是：
+ * 1. 读取并保存 LVGL 页面上的波形选择、频率和 Vpp 参数
+ * 2. 对外提供统一的波形控制接口
+ * 3. 保留后续接入 AD9833 所需的软件接口
  *
  * 当前约定：
- * - SwitchA 打开：输出正弦波
- * - SwitchB 打开：输出三角波
- * - SwitchC 打开：输出方波
+ * - SwitchA 选中：正弦波
+ * - SwitchB 选中：三角波
+ * - SwitchC 选中：方波
+ * - 三个开关都未选中：关闭输出
  *
- * 相关业务逻辑全部收敛在 Wave.c / Wave.h 中，
- * 不需要把波形控制逻辑再写进 LVGL 生成文件。
+ * 注意：
+ * - 片上 DAC 的波形生成逻辑已经移除
+ * - LVGL 侧接口和任务入口仍然保留，供后续 AD9833 复用
  */
 
 #ifndef __WAVE_H
@@ -27,7 +29,7 @@ extern "C" {
 #include "cmsis_os.h"
 
 /**
- * @brief 波形类型
+ * @brief 波形类型定义
  */
 typedef enum
 {
@@ -41,26 +43,26 @@ typedef enum
  * @brief 设置目标波形类型
  * @param wave_type 目标波形类型
  *
- * 该接口只是设置“希望切换到什么波形”，
- * 真正的平滑过渡由 Wave.c 内部的 DMA 流式生成逻辑完成。
+ * 该接口只负责记录“用户希望切换成什么波形”，
+ * 真正的硬件应用动作由 Wave.c 内部统一处理。
  */
 void Wave_SetWaveType(WaveType_t wave_type);
 
 /**
- * @brief 获取当前目标波形类型
- * @retval 当前目标波形类型
+ * @brief 获取当前请求的目标波形类型
+ * @retval 当前请求的目标波形类型
  */
 WaveType_t Wave_GetWaveType(void);
 
 /**
- * @brief DACTas 线程入口
+ * @brief 波形控制任务入口
  * @param argument 线程参数，当前未使用
  *
- * 线程启动后会：
- * 1. 初始化三种基础波形表
- * 2. 启动 DAC DMA 输出
- * 3. 周期性读取 UI 上三个开关的状态
- * 4. 在需要时平滑切换波形
+ * 当前任务不再负责片上 DAC 出波，仅负责：
+ * 1. 绑定并轮询 LVGL 控件
+ * 2. 解析频率与 Vpp 输入
+ * 3. 保存并分发最新的波形参数
+ * 4. 为后续 AD9833 后端保留统一入口
  */
 void DACStartTask(void *argument);
 
