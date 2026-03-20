@@ -109,7 +109,7 @@ osThreadId_t DACTasHandle;
 const osThreadAttr_t DACTas_attributes = {
   .name = "DACTas",
   .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityAboveNormal,
+  .priority = (osPriority_t) osPriorityHigh,
 };
 /* USER CODE BEGIN PV */
 osMutexId_t mutex_id;
@@ -629,7 +629,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 4, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
