@@ -2,10 +2,10 @@
  * @file Wave.h
  * @brief 波形控制模块对外接口
  *
- * 当前模块的职责是：
- * 1. 读取并保存 LVGL 页面上的波形选择、频率和 Vpp 参数
+ * 当前模块职责：
+ * 1. 读取并保存 LVGL 页面上的波形类型、频率和 Vpp 参数
  * 2. 对外提供统一的波形控制接口
- * 3. 保留后续接入 AD9833 所需的软件接口
+ * 3. 为后续接入 AD9833 保留稳定的软件接口
  *
  * 当前约定：
  * - SwitchA 选中：正弦波
@@ -14,8 +14,9 @@
  * - 三个开关都未选中：关闭输出
  *
  * 注意：
- * - 片上 DAC 的波形生成逻辑已经移除
- * - LVGL 侧接口和任务入口仍然保留，供后续 AD9833 复用
+ * - 本分支已经移除片上 DAC 出波逻辑
+ * - 模块不再创建独立波形线程
+ * - 上层任务需要周期性调用 Wave_Service()
  */
 
 #ifndef __WAVE_H
@@ -55,16 +56,23 @@ void Wave_SetWaveType(WaveType_t wave_type);
 WaveType_t Wave_GetWaveType(void);
 
 /**
- * @brief 波形控制任务入口
- * @param argument 线程参数，当前未使用
+ * @brief 初始化波形控制模块
  *
- * 当前任务不再负责片上 DAC 出波，仅负责：
- * 1. 绑定并轮询 LVGL 控件
- * 2. 解析频率与 Vpp 输入
- * 3. 保存并分发最新的波形参数
- * 4. 为后续 AD9833 后端保留统一入口
+ * 该接口只负责初始化模块状态，不会启动片上 DAC。
+ * 当前分支中，实际硬件输出逻辑预留给后续 AD9833 接入。
  */
-void DACStartTask(void *argument);
+void Wave_Init(void);
+
+/**
+ * @brief 周期性执行波形模块服务
+ *
+ * 建议在上层常驻任务中周期性调用。
+ * 当前主要负责：
+ * 1. 绑定并轮询 LVGL 控件
+ * 2. 解析频率和 Vpp 输入
+ * 3. 将参数同步到硬件输出适配占位接口
+ */
+void Wave_Service(void);
 
 #ifdef __cplusplus
 }
