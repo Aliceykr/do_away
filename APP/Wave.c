@@ -13,7 +13,7 @@
 extern osMutexId_t mutex_id;
 
 /* 默认值与输入范围约束，直接对应当前 UI 的使用范围。 */
-#define WAVE_DEFAULT_OUTPUT_FREQ_HZ    1000U
+#define WAVE_DEFAULT_OUTPUT_FREQ_HZ    10U
 #define WAVE_DEFAULT_OUTPUT_VPP_MV     3000U
 #define WAVE_MIN_OUTPUT_FREQ_HZ        10U
 #define WAVE_MAX_OUTPUT_FREQ_HZ        100000U
